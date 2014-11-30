@@ -39,13 +39,26 @@
 
 -record(resource, {virtual_host, kind, name}).
 
--record(exchange, {name, type, durable, auto_delete, internal, arguments,
-                   scratches, policy, decorators}).
--record(exchange_serial, {name, next}).
+%% fields described as 'transient' here are cleared when writing to
+%% rabbit_durable_<thing>
+-record(exchange, {
+          name, type, durable, auto_delete, internal, arguments, %% immutable
+          scratches,    %% durable, explicitly updated via update_scratch/3
+          policy,       %% durable, implicitly updated when policy changes
+          decorators}). %% transient, recalculated in store/1 (i.e. recovery)
 
--record(amqqueue, {name, durable, auto_delete, exclusive_owner = none,
-                   arguments, pid, slave_pids, sync_slave_pids, policy,
-                   gm_pids, decorators}).
+-record(amqqueue, {
+          name, durable, auto_delete, exclusive_owner = none, %% immutable
+          arguments,                   %% immutable
+          pid,                         %% durable (just so we know home node)
+          slave_pids, sync_slave_pids, %% transient
+          down_slave_nodes,            %% durable
+          policy,                      %% durable, implicit update as above
+          gm_pids,                     %% transient
+          decorators,                  %% transient, recalculated as above
+          state}).                     %% durable (have we crashed?)
+
+-record(exchange_serial, {name, next}).
 
 %% mnesia doesn't like unary records, so we add a dummy 'value' field
 -record(route, {binding, value = const}).
@@ -75,7 +88,7 @@
 
 -record(event, {type, props, reference = undefined, timestamp}).
 
--record(message_properties, {expiry, needs_confirming = false}).
+-record(message_properties, {expiry, needs_confirming = false, size}).
 
 -record(plugin, {name,          %% atom()
                  version,       %% string()
@@ -86,7 +99,7 @@
 
 %%----------------------------------------------------------------------------
 
--define(COPYRIGHT_MESSAGE, "Copyright (C) 2007-2013 GoPivotal, Inc.").
+-define(COPYRIGHT_MESSAGE, "Copyright (C) 2007-2014 GoPivotal, Inc.").
 -define(INFORMATION_MESSAGE, "Licensed under the MPL.  See http://www.rabbitmq.com/").
 -define(ERTS_MINIMUM, "5.6.3").
 
@@ -105,9 +118,6 @@
 -define(DESIRED_HIBERNATE,         10000).
 -define(CREDIT_DISC_BOUND,   {2000, 500}).
 
-%% This is dictated by `erlang:send_after' on which we depend to implement TTL.
--define(MAX_EXPIRY_TIMER, 4294967295).
-
 -define(INVALID_HEADERS_KEY, <<"x-invalid-headers">>).
 -define(ROUTING_HEADERS, [<<"CC">>, <<"BCC">>]).
 -define(DELETED_HEADER, <<"BCC">>).
@@ -119,12 +129,15 @@
 %% wrapping the message body).
 -define(MAX_MSG_SIZE, 2147383648).
 
+%% First number is maximum size in bytes before we start to
+%% truncate. The following 4-tuple is:
+%%
 %% 1) Maximum size of printable lists and binaries.
 %% 2) Maximum size of any structural term.
 %% 3) Amount to decrease 1) every time we descend while truncating.
 %% 4) Amount to decrease 2) every time we descend while truncating.
 %%
 %% Whole thing feeds into truncate:log_event/2.
--define(LOG_TRUNC, {2000, 100, 100, 7}).
+-define(LOG_TRUNC, {100000, {2000, 100, 50, 5}}).
 
 -define(store_proc_name(N), rabbit_misc:store_proc_name(?MODULE, N)).
