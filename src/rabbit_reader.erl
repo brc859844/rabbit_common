@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_reader).
@@ -57,6 +57,11 @@
         timeout, frame_max, channel_max, client_properties, connected_at]).
 
 -define(INFO_KEYS, ?CREATION_EVENT_KEYS ++ ?STATISTICS_KEYS -- [pid]).
+
+-define(AUTH_NOTIFICATION_INFO_KEYS,
+        [host, vhost, name, peer_host, peer_port, protocol, auth_mechanism,
+         ssl, ssl_protocol, ssl_cipher, peer_cert_issuer, peer_cert_subject,
+         peer_cert_validity]).
 
 -define(IS_RUNNING(State),
         (State#v1.connection_state =:= running orelse
@@ -191,7 +196,17 @@ socket_error(Reason) when is_atom(Reason) ->
     log(error, "Error on AMQP connection ~p: ~s~n",
         [self(), rabbit_misc:format_inet_error(Reason)]);
 socket_error(Reason) ->
-    log(error, "Error on AMQP connection ~p:~n~p~n", [self(), Reason]).
+    Level =
+        case Reason of
+            {ssl_upgrade_error, closed} ->
+                %% The socket was closed while upgrading to SSL.
+                %% This is presumably a TCP healthcheck, so don't log
+                %% it unless specified otherwise.
+                debug;
+            _ ->
+                error
+        end,
+    log(Level, "Error on AMQP connection ~p:~n~p~n", [self(), Reason]).
 
 inet_op(F) -> rabbit_misc:throw_on_error(inet_error, F).
 
@@ -214,7 +229,6 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
                                     rabbit_net:fast_close(Sock),
                                     exit(normal)
            end,
-    log(info, "accepting AMQP connection ~p (~s)~n", [self(), Name]),
     {ok, HandshakeTimeout} = application:get_env(rabbit, handshake_timeout),
     ClientSock = socket_op(Sock, SockTransform),
     erlang:send_after(HandshakeTimeout, self(), handshake_timeout),
@@ -259,11 +273,8 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
                                           handshake, 8)]}),
         log(info, "closing AMQP connection ~p (~s)~n", [self(), Name])
     catch
-        Ex -> log(case Ex of
-                      connection_closed_abruptly -> warning;
-                      _                          -> error
-                  end, "closing AMQP connection ~p (~s):~n~p~n",
-                  [self(), Name, Ex])
+        Ex ->
+          log_connection_exception(Name, Ex)
     after
         %% We don't call gen_tcp:close/1 here since it waits for
         %% pending output to be sent, which results in unnecessary
@@ -277,6 +288,22 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
         rabbit_event:notify(connection_closed, [{pid, self()}])
     end,
     done.
+
+log_connection_exception(Name, Ex) ->
+  Severity = case Ex of
+      connection_closed_with_no_data_received -> debug;
+      connection_closed_abruptly              -> warning;
+      _                                       -> error
+    end,
+  log_connection_exception(Severity, Name, Ex).
+
+log_connection_exception(Severity, Name, {heartbeat_timeout, TimeoutSec}) ->
+  %% Long line to avoid extra spaces and line breaks in log
+  log(Severity, "closing AMQP connection ~p (~s):~nMissed heartbeats from client, timeout: ~ps~n",
+    [self(), Name, TimeoutSec]);
+log_connection_exception(Severity, Name, Ex) ->
+  log(Severity, "closing AMQP connection ~p (~s):~n~p~n",
+    [self(), Name, Ex]).
 
 run({M, F, A}) ->
     try apply(M, F, A)
@@ -313,13 +340,35 @@ binlist_split(Len, L, [Acc0|Acc]) when Len < 0 ->
 binlist_split(Len, [H|T], Acc) ->
     binlist_split(Len - size(H), T, [H|Acc]).
 
-mainloop(Deb, Buf, BufLen, State = #v1{sock = Sock}) ->
-    case rabbit_net:recv(Sock) of
+mainloop(Deb, Buf, BufLen, State = #v1{sock = Sock,
+                                       connection_state = CS,
+                                       connection = #connection{
+                                         name = ConnName}}) ->
+    Recv = rabbit_net:recv(Sock),
+    case CS of
+        pre_init when Buf =:= [] ->
+            %% We only log incoming connections when either the
+            %% first byte was received or there was an error (eg. a
+            %% timeout).
+            %%
+            %% The goal is to not log TCP healthchecks (a connection
+            %% with no data received) unless specified otherwise.
+            log(case Recv of
+                  closed -> debug;
+                  _      -> info
+                end, "accepting AMQP connection ~p (~s)~n",
+                [self(), ConnName]);
+        _ ->
+            ok
+    end,
+    case Recv of
         {data, Data} ->
             recvloop(Deb, [Data | Buf], BufLen + size(Data),
                      State#v1{pending_recv = false});
         closed when State#v1.connection_state =:= closed ->
             ok;
+        closed when CS =:= pre_init andalso Buf =:= [] ->
+            stop(tcp_healthcheck, State);
         closed ->
             stop(closed, State);
         {error, Reason} ->
@@ -334,10 +383,18 @@ mainloop(Deb, Buf, BufLen, State = #v1{sock = Sock}) ->
             end
     end.
 
-stop(closed, State) -> maybe_emit_stats(State),
-                       throw(connection_closed_abruptly);
-stop(Reason, State) -> maybe_emit_stats(State),
-                       throw({inet_error, Reason}).
+stop(tcp_healthcheck, State) ->
+    %% The connection was closed before any packet was received. It's
+    %% probably a load-balancer healthcheck: don't consider this a
+    %% failure.
+    maybe_emit_stats(State),
+    throw(connection_closed_with_no_data_received);
+stop(closed, State) ->
+    maybe_emit_stats(State),
+    throw(connection_closed_abruptly);
+stop(Reason, State) ->
+    maybe_emit_stats(State),
+    throw({inet_error, Reason}).
 
 handle_other({conserve_resources, Source, Conserve},
              State = #v1{throttle = Throttle = #throttle{alarmed_by = CR}}) ->
@@ -388,9 +445,10 @@ handle_other(handshake_timeout, State) ->
     throw({handshake_timeout, State#v1.callback});
 handle_other(heartbeat_timeout, State = #v1{connection_state = closed}) ->
     State;
-handle_other(heartbeat_timeout, State = #v1{connection_state = S}) ->
+handle_other(heartbeat_timeout, 
+             State = #v1{connection = #connection{timeout_sec = T}}) ->
     maybe_emit_stats(State),
-    throw({heartbeat_timeout, S});
+    throw({heartbeat_timeout, T});
 handle_other({'$gen_call', From, {shutdown, Explanation}}, State) ->
     {ForceTermination, NewState} = terminate(Explanation, State),
     gen_server:reply(From, ok),
@@ -420,6 +478,7 @@ handle_other(ensure_stats, State) ->
 handle_other(emit_stats, State) ->
     emit_stats(State);
 handle_other({bump_credit, Msg}, State) ->
+    %% Here we are receiving credit by some channel process.
     credit_flow:handle_bump_msg(Msg),
     control_throttle(State);
 handle_other(Other, State) ->
@@ -944,7 +1003,7 @@ handle_method0(#'connection.open'{virtual_host = VHostPath},
                            helper_sup       = SupPid,
                            sock             = Sock,
                            throttle         = Throttle}) ->
-    ok = rabbit_access_control:check_vhost_access(User, VHostPath),
+    ok = rabbit_access_control:check_vhost_access(User, VHostPath, Sock),
     NewConnection = Connection#connection{vhost = VHostPath},
     ok = send_on_channel0(Sock, #'connection.open_ok'{}, Protocol),
     Conserve = rabbit_alarm:register(self(), {?MODULE, conserve_resources, []}),
@@ -1046,9 +1105,12 @@ auth_phase(Response,
                                        auth_state     = AuthState},
                        sock = Sock}) ->
     case AuthMechanism:handle_response(Response, AuthState) of
-        {refused, Msg, Args} ->
-            auth_fail(Msg, Args, Name, State);
+        {refused, Username, Msg, Args} ->
+            auth_fail(Username, Msg, Args, Name, State);
         {protocol_error, Msg, Args} ->
+            notify_auth_result(none, user_authentication_failure,
+                               [{error, rabbit_misc:format(Msg, Args)}],
+                               State),
             rabbit_misc:protocol_error(syntax_error, Msg, Args);
         {challenge, Challenge, AuthState1} ->
             Secure = #'connection.secure'{challenge = Challenge},
@@ -1057,9 +1119,12 @@ auth_phase(Response,
                                     auth_state = AuthState1}};
         {ok, User = #user{username = Username}} ->
             case rabbit_access_control:check_user_loopback(Username, Sock) of
-                ok          -> ok;
-                not_allowed -> auth_fail("user '~s' can only connect via "
-                                         "localhost", [Username], Name, State)
+                ok ->
+                    notify_auth_result(Username, user_authentication_success,
+                                       [], State);
+                not_allowed ->
+                    auth_fail(Username, "user '~s' can only connect via "
+                              "localhost", [Username], Name, State)
             end,
             Tune = #'connection.tune'{frame_max   = get_env(frame_max),
                                       channel_max = get_env(channel_max),
@@ -1071,11 +1136,15 @@ auth_phase(Response,
     end.
 
 -ifdef(use_specs).
--spec(auth_fail/4 :: (string(), [any()], binary(), #v1{}) -> no_return()).
+-spec(auth_fail/5 ::
+        (rabbit_types:username() | none, string(), [any()], binary(), #v1{}) ->
+           no_return()).
 -endif.
-auth_fail(Msg, Args, AuthName,
+auth_fail(Username, Msg, Args, AuthName,
           State = #v1{connection = #connection{protocol     = Protocol,
                                                capabilities = Capabilities}}) ->
+    notify_auth_result(Username, user_authentication_failure,
+      [{error, rabbit_misc:format(Msg, Args)}], State),
     AmqpError = rabbit_misc:amqp_error(
                   access_refused, "~s login refused: ~s",
                   [AuthName, io_lib:format(Msg, Args)], none),
@@ -1093,6 +1162,16 @@ auth_fail(Msg, Args, AuthName,
         _ -> ok
     end,
     rabbit_misc:protocol_error(AmqpError).
+
+notify_auth_result(Username, AuthResult, ExtraProps, State) ->
+    EventProps = [{connection_type, network},
+                  {name, case Username of none -> ''; _ -> Username end}] ++
+                 [case Item of
+                      name -> {connection_name, i(name, State)};
+                      _    -> {Item, i(Item, State)}
+                  end || Item <- ?AUTH_NOTIFICATION_INFO_KEYS] ++
+                 ExtraProps,
+    rabbit_event:notify(AuthResult, [P || {_, V} = P <- EventProps, V =/= '']).
 
 %%--------------------------------------------------------------------------
 
@@ -1167,9 +1246,9 @@ ssl_info(F, #v1{sock = Sock}) ->
 
 cert_info(F, #v1{sock = Sock}) ->
     case rabbit_net:peercert(Sock) of
-        nossl                -> '';
-        {error, no_peercert} -> '';
-        {ok, Cert}           -> list_to_binary(F(Cert))
+        nossl      -> '';
+        {error, _} -> '';
+        {ok, Cert} -> list_to_binary(F(Cert))
     end.
 
 maybe_emit_stats(State) ->

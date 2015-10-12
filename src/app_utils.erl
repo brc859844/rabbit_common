@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
 %%
 -module(app_utils).
 
@@ -62,13 +62,7 @@ start_applications(Apps, ErrorHandler) ->
 
 stop_applications(Apps, ErrorHandler) ->
     manage_applications(fun lists:foldr/3,
-                        %% Mitigation for bug 26467. TODO remove when we fix it.
-                        fun (mnesia) ->
-                                timer:sleep(1000),
-                                application:stop(mnesia);
-                            (App) ->
-                                application:stop(App)
-                        end,
+                        fun application:stop/1,
                         fun application:start/1,
                         not_started,
                         ErrorHandler,

@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_channel).
@@ -40,7 +40,9 @@
              queue_consumers, delivering_queues,
              queue_collector_pid, stats_timer, confirm_enabled, publish_seqno,
              unconfirmed, confirmed, mandatory, capabilities, trace_state,
-             consumer_prefetch, reply_consumer}).
+             consumer_prefetch, reply_consumer,
+             %% flow | noflow, see rabbitmq-server#114
+             delivery_flow}).
 
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
 
@@ -131,6 +133,8 @@ do(Pid, Method, Content) ->
     gen_server2:cast(Pid, {method, Method, Content, noflow}).
 
 do_flow(Pid, Method, Content) ->
+    %% Here we are tracking messages sent by the rabbit_reader
+    %% process. We are accessing the rabbit_reader process dictionary.
     credit_flow:send(Pid),
     gen_server2:cast(Pid, {method, Method, Content, flow}).
 
@@ -235,6 +239,10 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
     process_flag(trap_exit, true),
     ?store_proc_name({ConnName, Channel}),
     ok = pg_local:join(rabbit_channels, self()),
+    Flow = case rabbit_misc:get_env(rabbit, mirroring_flow_control, true) of
+             true   -> flow;
+             false  -> noflow
+           end,
     State = #ch{state                   = starting,
                 protocol                = Protocol,
                 channel                 = Channel,
@@ -263,7 +271,8 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
                 capabilities            = Capabilities,
                 trace_state             = rabbit_trace:init(VHost),
                 consumer_prefetch       = 0,
-                reply_consumer          = none},
+                reply_consumer          = none,
+                delivery_flow           = Flow},
     State1 = rabbit_event:init_stats_timer(State, #ch.stats_timer),
     rabbit_event:notify(channel_created, infos(?CREATION_EVENT_KEYS, State1)),
     rabbit_event:if_enabled(State1, #ch.stats_timer,
@@ -320,6 +329,9 @@ handle_cast({method, Method, Content, Flow},
             State = #ch{reader_pid   = Reader,
                         virtual_host = VHost}) ->
     case Flow of
+        %% We are going to process a message from the rabbit_reader
+        %% process, so here we ack it. In this case we are accessing
+        %% the rabbit_channel process dictionary.
         flow   -> credit_flow:ack(Reader);
         noflow -> ok
     end,
@@ -428,6 +440,12 @@ handle_cast({confirm, MsgSeqNos, QPid}, State = #ch{unconfirmed = UC}) ->
     noreply_coalesce(record_confirms(MXs, State#ch{unconfirmed = UC1})).
 
 handle_info({bump_credit, Msg}, State) ->
+    %% A rabbit_amqqueue_process is granting credit to our channel. If
+    %% our channel was being blocked by this process, and no other
+    %% process is blocking our channel, then this channel will be
+    %% unblocked. This means that any credit that was deferred will be
+    %% sent to rabbit_reader processs that might be blocked by this
+    %% particular channel.
     credit_flow:handle_bump_msg(Msg),
     noreply(State);
 
@@ -445,6 +463,11 @@ handle_info({'DOWN', _MRef, process, QPid, Reason}, State) ->
     State1 = handle_publishing_queue_down(QPid, Reason, State),
     State3 = handle_consuming_queue_down(QPid, State1),
     State4 = handle_delivering_queue_down(QPid, State3),
+    %% A rabbit_amqqueue_process has died. If our channel was being
+    %% blocked by this process, and no other process is blocking our
+    %% channel, then this channel will be unblocked. This means that
+    %% any credit that was deferred will be sent to the rabbit_reader
+    %% processs that might be blocked by this particular channel.
     credit_flow:peer_down(QPid),
     #ch{queue_names = QNames, queue_monitors = QMons} = State4,
     case dict:find(QPid, QNames) of
@@ -484,6 +507,8 @@ format_message_queue(Opt, MQ) -> rabbit_misc:format_message_queue(Opt, MQ).
 
 %%---------------------------------------------------------------------------
 
+log(Level, Fmt, Args) -> rabbit_log:log(channel, Level, Fmt, Args).
+
 reply(Reply, NewState) -> {reply, Reply, next_state(NewState), hibernate}.
 
 noreply(NewState) -> {noreply, next_state(NewState), hibernate}.
@@ -520,10 +545,10 @@ handle_exception(Reason, State = #ch{protocol     = Protocol,
     {_Result, State1} = notify_queues(State),
     case rabbit_binary_generator:map_exception(Channel, Reason, Protocol) of
         {Channel, CloseMethod} ->
-            rabbit_log:error("Channel error on connection ~p (~s, vhost: '~s',"
-                             " user: '~s'), channel ~p:~n~p~n",
-                             [ConnPid, ConnName, VHost, User#user.username,
-                              Channel, Reason]),
+            log(error, "Channel error on connection ~p (~s, vhost: '~s',"
+                       " user: '~s'), channel ~p:~n~p~n",
+                       [ConnPid, ConnName, VHost, User#user.username,
+                        Channel, Reason]),
             ok = rabbit_writer:send_command(WriterPid, CloseMethod),
             {noreply, State1};
         {0, _} ->
@@ -581,7 +606,8 @@ check_user_id_header(#'P_basic'{user_id = Username},
                      #ch{user = #user{username = Username}}) ->
     ok;
 check_user_id_header(
-  #'P_basic'{}, #ch{user = #user{auth_backend = rabbit_auth_backend_dummy}}) ->
+  #'P_basic'{}, #ch{user = #user{authz_backends =
+                                     [{rabbit_auth_backend_dummy, _}]}}) ->
     ok;
 check_user_id_header(#'P_basic'{user_id = Claimed},
                      #ch{user = #user{username = Actual,
@@ -660,7 +686,7 @@ check_not_default_exchange(#resource{kind = exchange, name = <<"">>}) ->
 check_not_default_exchange(_) ->
     ok.
 
-check_exchange_deletion(XName = #resource{name = <<"amq.rabbitmq.", _/binary>>,
+check_exchange_deletion(XName = #resource{name = <<"amq.", _/binary>>,
                                           kind = exchange}) ->
     rabbit_misc:protocol_error(
       access_refused, "deletion of system ~s not allowed",
@@ -767,7 +793,8 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
                                    confirm_enabled = ConfirmEnabled,
                                    trace_state     = TraceState,
                                    user            = #user{username = Username},
-                                   conn_name       = ConnName}) ->
+                                   conn_name       = ConnName,
+                                   delivery_flow   = Flow}) ->
     check_msg_size(Content),
     ExchangeName = rabbit_misc:r(VHostPath, exchange, ExchangeNameBin),
     check_write_permitted(ExchangeName, State),
@@ -789,12 +816,12 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
         end,
     case rabbit_basic:message(ExchangeName, RoutingKey, DecodedContent) of
         {ok, Message} ->
-            rabbit_trace:tap_in(Message, ConnName, ChannelNum,
-                                Username, TraceState),
             Delivery = rabbit_basic:delivery(
                          Mandatory, DoConfirm, Message, MsgSeqNo),
             QNames = rabbit_exchange:route(Exchange, Delivery),
-            DQ = {Delivery, QNames},
+            rabbit_trace:tap_in(Message, QNames, ConnName, ChannelNum,
+                                Username, TraceState),
+            DQ = {Delivery#delivery{flow = Flow}, QNames},
             {noreply, case Tx of
                           none         -> deliver_to_queues(DQ, State1);
                           {Msgs, Acks} -> Msgs1 = queue:in(DQ, Msgs),
@@ -1665,7 +1692,7 @@ deliver_to_queues({Delivery = #delivery{message    = Message = #basic_message{
                    DelQNames}, State = #ch{queue_names    = QNames,
                                            queue_monitors = QMons}) ->
     Qs = rabbit_amqqueue:lookup(DelQNames),
-    DeliveredQPids = rabbit_amqqueue:deliver_flow(Qs, Delivery),
+    DeliveredQPids = rabbit_amqqueue:deliver(Qs, Delivery),
     %% The pmon:monitor_all/2 monitors all queues to which we
     %% delivered. But we want to monitor even queues we didn't deliver
     %% to, since we need their 'DOWN' messages to clean
@@ -1735,7 +1762,7 @@ send_nacks(_, State) ->
 send_confirms(State = #ch{tx = none, confirmed = []}) ->
     State;
 send_confirms(State = #ch{tx = none, confirmed = C}) ->
-    case rabbit_node_monitor:pause_minority_guard() of
+    case rabbit_node_monitor:pause_partition_guard() of
         ok      -> MsgSeqNos =
                        lists:foldl(
                          fun ({MsgSeqNo, XName}, MSNs) ->
@@ -1747,7 +1774,7 @@ send_confirms(State = #ch{tx = none, confirmed = C}) ->
         pausing -> State
     end;
 send_confirms(State) ->
-    case rabbit_node_monitor:pause_minority_guard() of
+    case rabbit_node_monitor:pause_partition_guard() of
         ok      -> maybe_complete_tx(State);
         pausing -> State
     end.
